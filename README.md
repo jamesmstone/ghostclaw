@@ -202,14 +202,16 @@ docker run -d --name ghostclaw-daemon -p 8080:8080 ghostclaw daemon --host 0.0.0
 
 **Every subsystem is a trait — swap implementations with a config change, zero code changes.**
 
+</div>
+
+<div align="center">
+
 <img src="img/Ghostclaw_architecture.png" alt="GhostClaw Architecture" width="100%">
 
 </div>
 
 <details>
 <summary><b>📋 View Subsystem Details</b></summary>
-
-<br>
 
 | Subsystem            | Trait          | Ships with                                                                                                                                                        | Extend                                                    |
 | -------------------- | -------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------- | --------------------------------------------------------- |
