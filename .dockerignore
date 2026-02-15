@@ -1,0 +1,8 @@
+build/
+cmake-build-*/
+.git/
+.github/
+references/
+*.db
+*.db-journal
+.env

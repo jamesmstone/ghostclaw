@@ -1,0 +1,53 @@
+# Build directories
+/build/
+/build-*/
+/cmake-build-*/
+/target/
+
+# Editor files
+*.swp
+*.swo
+.DS_Store
+
+# Environment and secrets
+.env
+secrets.key
+.ghostclaw-config.toml
+
+# Database files
+*.db
+*.db-journal
+
+# Runtime files
+daemon_state.json
+daemon-debug.log
+telegram-log.txt
+
+# Compiled objects
+*.o
+*.obj
+*.a
+*.lib
+*.so
+*.dylib
+*.dll
+*.exe
+
+# Build artifacts
+compile_commands.json
+
+# Test files (keep in repo but ignore local test configs)
+test-config.toml
+
+# Cache
+.cache/
+
+# Workspace (personal skills)
+/workspace/
+
+# Reference documentation
+/references/
+
+# Documentation (keep only README.md)
+*.md
+!README.md

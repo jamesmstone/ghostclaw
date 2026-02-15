@@ -1,0 +1,39 @@
+FROM alpine:3.21 AS builder
+
+RUN apk add --no-cache \
+    build-base \
+    cmake \
+    ninja \
+    curl-dev \
+    openssl-dev \
+    sqlite-dev \
+    ca-certificates
+
+WORKDIR /app
+COPY . .
+
+RUN cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release -DBUILD_STATIC=ON
+RUN cmake --build build --parallel
+
+FROM alpine:3.21
+
+RUN apk add --no-cache \
+    ca-certificates \
+    curl \
+    openssl \
+    sqlite-libs
+
+RUN adduser -D ghostclaw
+USER ghostclaw
+WORKDIR /home/ghostclaw
+
+COPY --from=builder /app/build/ghostclaw /usr/local/bin/ghostclaw
+
+EXPOSE 8080
+VOLUME ["/home/ghostclaw/.ghostclaw"]
+ENV GHOSTCLAW_CONFIG_DIR=/home/ghostclaw/.ghostclaw
+
+HEALTHCHECK --interval=30s --timeout=5s --start-period=10s \
+  CMD ["ghostclaw", "status"]
+
+ENTRYPOINT ["ghostclaw"]

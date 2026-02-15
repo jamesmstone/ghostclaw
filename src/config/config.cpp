@@ -1,0 +1,1040 @@
+#include "ghostclaw/config/config.hpp"
+
+#include "ghostclaw/auth/oauth.hpp"
+#include "ghostclaw/common/fs.hpp"
+#include "ghostclaw/common/toml.hpp"
+
+#include <filesystem>
+#include <fstream>
+#include <cmath>
+#include <cstdlib>
+#include <cctype>
+#include <regex>
+#include <sstream>
+#include <vector>
+
+namespace ghostclaw::config {
+
+namespace {
+
+constexpr const char *CONFIG_FOLDER = ".ghostclaw";
+constexpr const char *CONFIG_FILENAME = "config.toml";
+std::optional<std::filesystem::path> g_config_path_override;
+
+std::optional<std::filesystem::path> resolved_config_path_override() {
+  if (g_config_path_override.has_value()) {
+    return std::filesystem::path(common::expand_path(g_config_path_override->string()));
+  }
+  if (const char *env = std::getenv("GHOSTCLAW_CONFIG_PATH"); env != nullptr && *env != '\0') {
+    return std::filesystem::path(common::expand_path(env));
+  }
+  return std::nullopt;
+}
+
+std::string expand_config_value(const std::string &value) {
+  if (value.find('$') == std::string::npos && value.find('~') == std::string::npos) {
+    return value;
+  }
+  return common::expand_path(value);
+}
+
+std::string strip_env_quotes(const std::string &raw) {
+  std::string value = common::trim(raw);
+  if (value.size() >= 2 && value.front() == '"' && value.back() == '"') {
+    std::string out;
+    out.reserve(value.size() - 2);
+    bool escaped = false;
+    for (std::size_t i = 1; i + 1 < value.size(); ++i) {
+      const char ch = value[i];
+      if (!escaped) {
+        if (ch == '\\') {
+          escaped = true;
+          continue;
+        }
+        out.push_back(ch);
+        continue;
+      }
+      switch (ch) {
+      case 'n':
+        out.push_back('\n');
+        break;
+      case 'r':
+        out.push_back('\r');
+        break;
+      case 't':
+        out.push_back('\t');
+        break;
+      case '"':
+      case '\\':
+        out.push_back(ch);
+        break;
+      default:
+        out.push_back(ch);
+        break;
+      }
+      escaped = false;
+    }
+    return out;
+  }
+  if (value.size() >= 2 && value.front() == '\'' && value.back() == '\'') {
+    return value.substr(1, value.size() - 2);
+  }
+  return value;
+}
+
+bool is_valid_env_name(const std::string &name) {
+  if (name.empty()) {
+    return false;
+  }
+  if (!(std::isalpha(static_cast<unsigned char>(name.front())) != 0 || name.front() == '_')) {
+    return false;
+  }
+  for (const char ch : name) {
+    const auto uch = static_cast<unsigned char>(ch);
+    if (!(std::isalnum(uch) != 0 || ch == '_')) {
+      return false;
+    }
+  }
+  return true;
+}
+
+void set_env_if_missing(const std::string &name, const std::string &value) {
+  if (!is_valid_env_name(name)) {
+    return;
+  }
+  if (const char *existing = std::getenv(name.c_str()); existing != nullptr && *existing != '\0') {
+    return;
+  }
+#if defined(_WIN32)
+  _putenv_s(name.c_str(), value.c_str());
+#else
+  setenv(name.c_str(), value.c_str(), 0);
+#endif
+}
+
+void load_dotenv_file(const std::filesystem::path &path) {
+  if (!std::filesystem::exists(path) || !std::filesystem::is_regular_file(path)) {
+    return;
+  }
+
+  std::ifstream file(path);
+  if (!file) {
+    return;
+  }
+
+  std::string line;
+  while (std::getline(file, line)) {
+    std::string trimmed = common::trim(line);
+    if (trimmed.empty() || trimmed.front() == '#') {
+      continue;
+    }
+    if (common::starts_with(trimmed, "export ")) {
+      trimmed = common::trim(trimmed.substr(7));
+    }
+
+    const auto eq = trimmed.find('=');
+    if (eq == std::string::npos) {
+      continue;
+    }
+
+    const std::string key = common::trim(trimmed.substr(0, eq));
+    const std::string value = strip_env_quotes(trimmed.substr(eq + 1));
+    if (key.empty()) {
+      continue;
+    }
+    set_env_if_missing(key, value);
+  }
+}
+
+void load_dotenv_files() {
+  std::vector<std::filesystem::path> candidates;
+  if (const char *env_file = std::getenv("GHOSTCLAW_ENV_FILE");
+      env_file != nullptr && *env_file != '\0') {
+    candidates.emplace_back(common::expand_path(env_file));
+  }
+  // Config dir .env takes priority (loaded first so set_env_if_missing keeps it)
+  if (auto dir = config_dir(); dir.ok()) {
+    candidates.push_back(dir.value() / ".env");
+  }
+  // CWD .env as fallback for dev builds
+  std::error_code ec;
+  const auto cwd = std::filesystem::current_path(ec);
+  if (!ec) {
+    candidates.push_back(cwd / ".env");
+  }
+
+  for (const auto &candidate : candidates) {
+    load_dotenv_file(candidate);
+  }
+}
+
+void load_channel_config(Config &config, const common::TomlDocument &doc) {
+  if (doc.has("channels.telegram.bot_token")) {
+    TelegramConfig telegram;
+    telegram.bot_token = expand_config_value(doc.get_string("channels.telegram.bot_token"));
+    telegram.allowed_users = doc.get_string_array("channels.telegram.allowed_users");
+    config.channels.telegram = std::move(telegram);
+  }
+
+  if (doc.has("channels.discord.bot_token")) {
+    DiscordConfig discord;
+    discord.bot_token = expand_config_value(doc.get_string("channels.discord.bot_token"));
+    discord.guild_id = expand_config_value(doc.get_string("channels.discord.guild_id"));
+    discord.allowed_users = doc.get_string_array("channels.discord.allowed_users");
+    config.channels.discord = std::move(discord);
+  }
+
+  if (doc.has("channels.slack.bot_token")) {
+    SlackConfig slack;
+    slack.bot_token = expand_config_value(doc.get_string("channels.slack.bot_token"));
+    slack.channel_id = expand_config_value(doc.get_string("channels.slack.channel_id"));
+    slack.allowed_users = doc.get_string_array("channels.slack.allowed_users");
+    config.channels.slack = std::move(slack);
+  }
+
+  if (doc.has("channels.matrix.homeserver")) {
+    MatrixConfig matrix;
+    matrix.homeserver = expand_config_value(doc.get_string("channels.matrix.homeserver"));
+    matrix.access_token = expand_config_value(doc.get_string("channels.matrix.access_token"));
+    matrix.room_id = expand_config_value(doc.get_string("channels.matrix.room_id"));
+    config.channels.matrix = std::move(matrix);
+  }
+
+  if (doc.has("channels.imessage.allowed_contacts")) {
+    IMessageConfig imessage;
+    imessage.allowed_contacts = doc.get_string_array("channels.imessage.allowed_contacts");
+    config.channels.imessage = std::move(imessage);
+  }
+
+  if (doc.has("channels.whatsapp.access_token")) {
+    WhatsAppConfig whatsapp;
+    whatsapp.access_token = expand_config_value(doc.get_string("channels.whatsapp.access_token"));
+    whatsapp.phone_number_id = expand_config_value(doc.get_string("channels.whatsapp.phone_number_id"));
+    whatsapp.verify_token = expand_config_value(doc.get_string("channels.whatsapp.verify_token"));
+    whatsapp.allowed_numbers = doc.get_string_array("channels.whatsapp.allowed_numbers");
+    config.channels.whatsapp = std::move(whatsapp);
+  }
+
+  if (doc.has("channels.webhook.secret")) {
+    WebhookConfig webhook;
+    webhook.secret = expand_config_value(doc.get_string("channels.webhook.secret"));
+    config.channels.webhook = std::move(webhook);
+  }
+}
+
+void load_tunnel_config(Config &config, const common::TomlDocument &doc) {
+  config.tunnel.provider = doc.get_string("tunnel.provider", config.tunnel.provider);
+
+  if (doc.has("tunnel.cloudflare.command_path")) {
+    CloudflareConfig cloudflare;
+    cloudflare.command_path = doc.get_string("tunnel.cloudflare.command_path");
+    config.tunnel.cloudflare = std::move(cloudflare);
+  }
+
+  if (doc.has("tunnel.ngrok.auth_token")) {
+    NgrokConfig ngrok;
+    ngrok.auth_token = expand_config_value(doc.get_string("tunnel.ngrok.auth_token"));
+    config.tunnel.ngrok = std::move(ngrok);
+  }
+
+  if (doc.has("tunnel.tailscale.hostname")) {
+    TailscaleConfig tailscale;
+    tailscale.hostname = expand_config_value(doc.get_string("tunnel.tailscale.hostname"));
+    config.tunnel.tailscale = std::move(tailscale);
+  }
+
+  if (doc.has("tunnel.custom.command")) {
+    CustomTunnelConfig custom;
+    custom.command = expand_config_value(doc.get_string("tunnel.custom.command"));
+    custom.args = doc.get_string_array("tunnel.custom.args");
+    config.tunnel.custom = std::move(custom);
+  }
+}
+
+bool is_valid_host(const std::string &host) {
+  if (host.empty()) {
+    return false;
+  }
+
+  static const std::regex host_re(
+      R"(^(([a-zA-Z0-9]([a-zA-Z0-9\-]{0,61}[a-zA-Z0-9])?\.)*[a-zA-Z0-9]([a-zA-Z0-9\-]{0,61}[a-zA-Z0-9])?|((25[0-5]|2[0-4][0-9]|[01]?[0-9]?[0-9])\.){3}(25[0-5]|2[0-4][0-9]|[01]?[0-9]?[0-9])|::1|\[::1\])$)");
+  return std::regex_match(host, host_re);
+}
+
+std::vector<std::string> known_providers() {
+  return {"openrouter",
+          "anthropic",
+          "openai",
+          "openai-codex",
+          "opencode",
+          "google",
+          "google-vertex",
+          "google-antigravity",
+          "google-gemini-cli",
+          "zai",
+          "vercel-ai-gateway",
+          "xai",
+          "grok",
+          "groq",
+          "cerebras",
+          "mistral",
+          "github-copilot",
+          "huggingface",
+          "moonshot",
+          "kimi-coding",
+          "qwen-portal",
+          "synthetic",
+          "minimax",
+          "ollama",
+          "vllm",
+          "litellm",
+          "xiaomi",
+          "venice",
+          "together",
+          "qianfan",
+          "deepseek",
+          "fireworks",
+          "perplexity",
+          "cohere",
+          "nvidia",
+          "cloudflare-ai-gateway",
+          "cloudflare",
+          "glm"};
+}
+
+std::string normalize_provider_alias(const std::string &provider) {
+  std::string normalized = common::to_lower(common::trim(provider));
+  if (normalized == "z.ai" || normalized == "z-ai") {
+    return "zai";
+  }
+  if (normalized == "opencode-zen") {
+    return "opencode";
+  }
+  if (normalized == "kimi-code") {
+    return "kimi-coding";
+  }
+  if (normalized == "cloudflare-ai") {
+    return "cloudflare-ai-gateway";
+  }
+  return normalized;
+}
+
+bool provider_is_known(const std::string &provider) {
+  if (common::starts_with(common::to_lower(common::trim(provider)), "custom:")) {
+    return true;
+  }
+  const std::string normalized = normalize_provider_alias(provider);
+  const auto providers = known_providers();
+  for (const auto &known : providers) {
+    if (normalized == known) {
+      return true;
+    }
+  }
+  return false;
+}
+
+std::string bool_to_toml(bool value) { return value ? "true" : "false"; }
+
+std::string string_array_to_toml(const std::vector<std::string> &values) {
+  std::ostringstream stream;
+  stream << '[';
+  for (std::size_t index = 0; index < values.size(); ++index) {
+    if (index > 0) {
+      stream << ", ";
+    }
+    stream << common::quote_toml_string(values[index]);
+  }
+  stream << ']';
+  return stream.str();
+}
+
+} // namespace
+
+common::Result<std::filesystem::path> config_dir() {
+  if (const auto override_path = resolved_config_path_override(); override_path.has_value()) {
+    std::error_code ec;
+    std::filesystem::path candidate = *override_path;
+    if (std::filesystem::is_directory(candidate, ec) || candidate.filename().empty()) {
+      return common::ensure_dir(candidate);
+    }
+
+    auto parent = candidate.parent_path();
+    if (parent.empty()) {
+      parent = std::filesystem::current_path(ec);
+      if (ec) {
+        return common::Result<std::filesystem::path>::failure("unable to resolve current directory");
+      }
+    }
+    return common::ensure_dir(parent);
+  }
+
+  const auto home = common::home_dir();
+  if (!home.ok()) {
+    return common::Result<std::filesystem::path>::failure(home.error());
+  }
+
+  return common::ensure_dir(home.value() / CONFIG_FOLDER);
+}
+
+common::Result<std::filesystem::path> config_path() {
+  if (const auto override_path = resolved_config_path_override(); override_path.has_value()) {
+    std::error_code ec;
+    if (std::filesystem::is_directory(*override_path, ec) || override_path->filename().empty()) {
+      return common::Result<std::filesystem::path>::success(*override_path / CONFIG_FILENAME);
+    }
+    return common::Result<std::filesystem::path>::success(*override_path);
+  }
+
+  const auto cfg_dir = config_dir();
+  if (!cfg_dir.ok()) {
+    return common::Result<std::filesystem::path>::failure(cfg_dir.error());
+  }
+  return common::Result<std::filesystem::path>::success(cfg_dir.value() / CONFIG_FILENAME);
+}
+
+common::Result<std::filesystem::path> workspace_dir() {
+  const auto cfg_dir = config_dir();
+  if (!cfg_dir.ok()) {
+    return common::Result<std::filesystem::path>::failure(cfg_dir.error());
+  }
+  return common::ensure_dir(cfg_dir.value() / "workspace");
+}
+
+bool config_exists() {
+  const auto path = config_path();
+  return path.ok() && std::filesystem::exists(path.value());
+}
+
+void set_config_path_override(std::optional<std::filesystem::path> path) {
+  if (!path.has_value()) {
+    g_config_path_override = std::nullopt;
+    return;
+  }
+  g_config_path_override = std::filesystem::path(common::expand_path(path->string()));
+}
+
+void clear_config_path_override() { g_config_path_override = std::nullopt; }
+
+std::optional<std::filesystem::path> config_path_override() {
+  return resolved_config_path_override();
+}
+
+std::string expand_config_path(const std::string &path) { return common::expand_path(path); }
+
+void apply_env_overrides(Config &config) {
+  load_dotenv_files();
+
+  if (const char *provider = std::getenv("GHOSTCLAW_PROVIDER"); provider != nullptr && *provider) {
+    config.default_provider = provider;
+  }
+
+  if (const char *model = std::getenv("GHOSTCLAW_MODEL"); model != nullptr && *model) {
+    config.default_model = model;
+  }
+
+  if (const char *api_key = std::getenv("GHOSTCLAW_API_KEY"); api_key != nullptr && *api_key) {
+    config.api_key = std::string(api_key);
+    return;
+  }
+
+  if (config.api_key.has_value() && !common::trim(*config.api_key).empty()) {
+    return;
+  }
+
+  const std::string provider = normalize_provider_alias(config.default_provider);
+  if ((provider == "xai" || provider == "grok")) {
+    if (const char *xai_key = std::getenv("XAI_API_KEY"); xai_key != nullptr && *xai_key) {
+      config.api_key = std::string(xai_key);
+    }
+  }
+}
+
+common::Result<Config> load_config() {
+  load_dotenv_files();
+
+  Config config;
+
+  const auto cfg_path_result = config_path();
+  if (!cfg_path_result.ok()) {
+    return common::Result<Config>::failure(cfg_path_result.error());
+  }
+
+  const auto path = cfg_path_result.value();
+  if (!std::filesystem::exists(path)) {
+    apply_env_overrides(config);
+    return common::Result<Config>::success(std::move(config));
+  }
+
+  std::ifstream file(path);
+  if (!file) {
+    return common::Result<Config>::failure("Unable to open config file: " + path.string());
+  }
+
+  std::stringstream buffer;
+  buffer << file.rdbuf();
+  const auto parsed = common::parse_toml(buffer.str());
+  if (!parsed.ok()) {
+    return common::Result<Config>::failure(parsed.error());
+  }
+
+  const auto &doc = parsed.value();
+
+  if (doc.has("default_provider")) {
+    config.default_provider =
+        expand_config_value(doc.get_string("default_provider", config.default_provider));
+  } else if (doc.has("providers.default")) {
+    config.default_provider =
+        expand_config_value(doc.get_string("providers.default", config.default_provider));
+  }
+  if (doc.has("default_model")) {
+    config.default_model = expand_config_value(doc.get_string("default_model", config.default_model));
+  } else if (doc.has("providers.default_model")) {
+    config.default_model =
+        expand_config_value(doc.get_string("providers.default_model", config.default_model));
+  }
+  if (doc.has("default_temperature")) {
+    config.default_temperature =
+        doc.get_double("default_temperature", config.default_temperature);
+  } else if (doc.has("providers.default_temperature")) {
+    config.default_temperature =
+        doc.get_double("providers.default_temperature", config.default_temperature);
+  }
+
+  if (doc.has("api_key")) {
+    config.api_key = expand_config_value(doc.get_string("api_key"));
+  } else {
+    const std::string provider_key = normalize_provider_alias(config.default_provider);
+    const std::string provider_api_key_path = "providers." + provider_key + ".api_key";
+    if (doc.has(provider_api_key_path)) {
+      config.api_key = expand_config_value(doc.get_string(provider_api_key_path));
+    }
+  }
+
+  config.memory.backend = doc.get_string("memory.backend", config.memory.backend);
+  config.memory.auto_save = doc.get_bool("memory.auto_save", config.memory.auto_save);
+
+  // Backward compatibility for legacy memory embedding keys.
+  if (doc.has("memory.embedding_provider")) {
+    config.memory.embedding_provider =
+        doc.get_string("memory.embedding_provider", config.memory.embedding_provider);
+  } else if (doc.has("memory.embeddings.provider")) {
+    config.memory.embedding_provider =
+        doc.get_string("memory.embeddings.provider", config.memory.embedding_provider);
+  }
+  if (doc.has("memory.embedding_model")) {
+    config.memory.embedding_model =
+        doc.get_string("memory.embedding_model", config.memory.embedding_model);
+  } else if (doc.has("memory.embeddings.model")) {
+    config.memory.embedding_model =
+        doc.get_string("memory.embeddings.model", config.memory.embedding_model);
+  }
+  if (doc.has("memory.embedding_dimensions")) {
+    config.memory.embedding_dimensions = static_cast<std::size_t>(
+        doc.get_u64("memory.embedding_dimensions", config.memory.embedding_dimensions));
+  } else if (doc.has("memory.embeddings.dimensions")) {
+    config.memory.embedding_dimensions = static_cast<std::size_t>(
+        doc.get_u64("memory.embeddings.dimensions", config.memory.embedding_dimensions));
+  }
+  config.memory.embedding_cache_size =
+      static_cast<std::size_t>(doc.get_u64("memory.embedding_cache_size", config.memory.embedding_cache_size));
+  config.memory.vector_weight = doc.get_double("memory.vector_weight", config.memory.vector_weight);
+  config.memory.keyword_weight = doc.get_double("memory.keyword_weight", config.memory.keyword_weight);
+
+  config.gateway.require_pairing = doc.get_bool("gateway.require_pairing", config.gateway.require_pairing);
+  config.gateway.paired_tokens = doc.get_string_array("gateway.paired_tokens", config.gateway.paired_tokens);
+  config.gateway.allow_public_bind =
+      doc.get_bool("gateway.allow_public_bind", config.gateway.allow_public_bind);
+  config.gateway.port = static_cast<std::uint16_t>(doc.get_int("gateway.port", config.gateway.port));
+  config.gateway.host = doc.get_string("gateway.host", config.gateway.host);
+  config.gateway.websocket_enabled =
+      doc.get_bool("gateway.websocket_enabled", config.gateway.websocket_enabled);
+  config.gateway.websocket_port =
+      static_cast<std::uint16_t>(doc.get_int("gateway.websocket_port", config.gateway.websocket_port));
+  config.gateway.websocket_host = doc.get_string("gateway.websocket_host", config.gateway.websocket_host);
+  config.gateway.websocket_tls_enabled =
+      doc.get_bool("gateway.websocket_tls_enabled", config.gateway.websocket_tls_enabled);
+  config.gateway.websocket_tls_cert_file =
+      doc.get_string("gateway.websocket_tls_cert_file", config.gateway.websocket_tls_cert_file);
+  config.gateway.websocket_tls_key_file =
+      doc.get_string("gateway.websocket_tls_key_file", config.gateway.websocket_tls_key_file);
+  config.gateway.session_send_policy_enabled = doc.get_bool(
+      "gateway.session_send_policy_enabled", config.gateway.session_send_policy_enabled);
+  config.gateway.session_send_policy_max_per_window = static_cast<std::uint32_t>(doc.get_u64(
+      "gateway.session_send_policy_max_per_window",
+      config.gateway.session_send_policy_max_per_window));
+  config.gateway.session_send_policy_window_seconds = static_cast<std::uint32_t>(doc.get_u64(
+      "gateway.session_send_policy_window_seconds",
+      config.gateway.session_send_policy_window_seconds));
+  if (!config.gateway.websocket_tls_cert_file.empty()) {
+    config.gateway.websocket_tls_cert_file =
+        expand_config_path(config.gateway.websocket_tls_cert_file);
+  }
+  if (!config.gateway.websocket_tls_key_file.empty()) {
+    config.gateway.websocket_tls_key_file =
+        expand_config_path(config.gateway.websocket_tls_key_file);
+  }
+
+  config.autonomy.level = doc.get_string("autonomy.level", config.autonomy.level);
+  config.autonomy.workspace_only = doc.get_bool("autonomy.workspace_only", config.autonomy.workspace_only);
+  config.autonomy.allowed_commands =
+      doc.get_string_array("autonomy.allowed_commands", config.autonomy.allowed_commands);
+  config.autonomy.forbidden_paths =
+      doc.get_string_array("autonomy.forbidden_paths", config.autonomy.forbidden_paths);
+  config.autonomy.max_actions_per_hour =
+      static_cast<std::uint32_t>(doc.get_u64("autonomy.max_actions_per_hour", config.autonomy.max_actions_per_hour));
+  config.autonomy.max_cost_per_day_cents =
+      static_cast<std::uint32_t>(doc.get_u64("autonomy.max_cost_per_day_cents", config.autonomy.max_cost_per_day_cents));
+
+  load_channel_config(config, doc);
+  load_tunnel_config(config, doc);
+
+  config.observability.backend = doc.get_string("observability.backend", config.observability.backend);
+  config.runtime.kind = doc.get_string("runtime.kind", config.runtime.kind);
+
+  config.reliability.provider_retries =
+      static_cast<std::uint32_t>(doc.get_u64("reliability.provider_retries", config.reliability.provider_retries));
+  config.reliability.provider_backoff_ms =
+      doc.get_u64("reliability.provider_backoff_ms", config.reliability.provider_backoff_ms);
+  config.reliability.fallback_providers =
+      doc.get_string_array("reliability.fallback_providers", config.reliability.fallback_providers);
+  config.reliability.channel_initial_backoff_secs =
+      doc.get_u64("reliability.channel_initial_backoff_secs", config.reliability.channel_initial_backoff_secs);
+  config.reliability.channel_max_backoff_secs =
+      doc.get_u64("reliability.channel_max_backoff_secs", config.reliability.channel_max_backoff_secs);
+  config.reliability.scheduler_poll_secs =
+      doc.get_u64("reliability.scheduler_poll_secs", config.reliability.scheduler_poll_secs);
+  config.reliability.scheduler_retries =
+      static_cast<std::uint32_t>(doc.get_u64("reliability.scheduler_retries", config.reliability.scheduler_retries));
+
+  config.heartbeat.enabled = doc.get_bool("heartbeat.enabled", config.heartbeat.enabled);
+  config.heartbeat.interval_minutes =
+      doc.get_u64("heartbeat.interval_minutes", config.heartbeat.interval_minutes);
+  config.heartbeat.tasks_file = doc.get_string("heartbeat.tasks_file", config.heartbeat.tasks_file);
+
+  config.browser.enabled = doc.get_bool("browser.enabled", config.browser.enabled);
+  config.browser.allowed_domains =
+      doc.get_string_array("browser.allowed_domains", config.browser.allowed_domains);
+  config.browser.session_name = doc.get_string("browser.session_name", config.browser.session_name);
+
+  config.tools.profile = doc.get_string("tools.profile", config.tools.profile);
+  config.tools.allow.groups =
+      doc.get_string_array("tools.allow.groups", config.tools.allow.groups);
+  config.tools.allow.tools = doc.get_string_array("tools.allow.tools", config.tools.allow.tools);
+  config.tools.allow.deny = doc.get_string_array("tools.allow.deny", config.tools.allow.deny);
+
+  config.calendar.backend = doc.get_string("calendar.backend", config.calendar.backend);
+  config.calendar.default_calendar =
+      doc.get_string("calendar.default_calendar", config.calendar.default_calendar);
+
+  config.email.backend = doc.get_string("email.backend", config.email.backend);
+  config.email.default_account = doc.get_string("email.default_account", config.email.default_account);
+  if (doc.has("email.smtp.host") || doc.has("email.smtp.port") || doc.has("email.smtp.username") ||
+      doc.has("email.smtp.password") || doc.has("email.smtp.tls")) {
+    EmailSmtpConfig smtp;
+    smtp.host = doc.get_string("email.smtp.host", smtp.host);
+    smtp.port = static_cast<std::uint16_t>(doc.get_u64("email.smtp.port", smtp.port));
+    smtp.username = doc.get_string("email.smtp.username", smtp.username);
+    smtp.password = doc.get_string("email.smtp.password", smtp.password);
+    smtp.tls = doc.get_bool("email.smtp.tls", smtp.tls);
+    config.email.smtp = std::move(smtp);
+  }
+
+  config.reminders.default_channel =
+      doc.get_string("reminders.default_channel", config.reminders.default_channel);
+
+  config.web_search.provider = doc.get_string("web_search.provider", config.web_search.provider);
+  if (doc.has("web_search.brave_api_key")) {
+    config.web_search.brave_api_key = doc.get_string("web_search.brave_api_key");
+  }
+
+  config.composio.enabled = doc.get_bool("composio.enabled", config.composio.enabled);
+  if (doc.has("composio.api_key")) {
+    config.composio.api_key = expand_config_value(doc.get_string("composio.api_key"));
+  }
+
+  config.identity.format = doc.get_string("identity.format", config.identity.format);
+  if (doc.has("identity.aieos_path")) {
+    config.identity.aieos_path = expand_config_path(doc.get_string("identity.aieos_path"));
+  }
+  if (doc.has("identity.aieos_inline")) {
+    config.identity.aieos_inline = doc.get_string("identity.aieos_inline");
+  }
+
+  config.secrets.encrypt = doc.get_bool("secrets.encrypt", config.secrets.encrypt);
+
+  for (auto &path_entry : config.autonomy.forbidden_paths) {
+    path_entry = expand_config_path(path_entry);
+  }
+  if (config.tunnel.cloudflare.has_value()) {
+    config.tunnel.cloudflare->command_path = expand_config_path(config.tunnel.cloudflare->command_path);
+  }
+
+  apply_env_overrides(config);
+  return common::Result<Config>::success(std::move(config));
+}
+
+common::Status save_config(const Config &config) {
+  const auto cfg_path_result = config_path();
+  if (!cfg_path_result.ok()) {
+    return common::Status::error(cfg_path_result.error());
+  }
+
+  const std::filesystem::path path = cfg_path_result.value();
+  if (!path.parent_path().empty()) {
+    std::error_code ensure_ec;
+    std::filesystem::create_directories(path.parent_path(), ensure_ec);
+    if (ensure_ec) {
+      return common::Status::error("Failed to create config directory: " + ensure_ec.message());
+    }
+  }
+  const std::filesystem::path tmp_path = path.string() + ".tmp";
+
+  std::ofstream file(tmp_path, std::ios::trunc);
+  if (!file) {
+    return common::Status::error("Unable to write temporary config file");
+  }
+
+  file << "default_provider = " << common::quote_toml_string(config.default_provider) << "\n";
+  file << "default_model = " << common::quote_toml_string(config.default_model) << "\n";
+  file << "default_temperature = " << config.default_temperature << "\n";
+  if (config.api_key.has_value()) {
+    file << "api_key = " << common::quote_toml_string(*config.api_key) << "\n";
+  }
+
+  file << "\n[memory]\n";
+  file << "backend = " << common::quote_toml_string(config.memory.backend) << "\n";
+  file << "auto_save = " << bool_to_toml(config.memory.auto_save) << "\n";
+  file << "embedding_provider = " << common::quote_toml_string(config.memory.embedding_provider)
+       << "\n";
+  file << "embedding_model = " << common::quote_toml_string(config.memory.embedding_model) << "\n";
+  file << "embedding_dimensions = " << config.memory.embedding_dimensions << "\n";
+  file << "embedding_cache_size = " << config.memory.embedding_cache_size << "\n";
+  file << "vector_weight = " << config.memory.vector_weight << "\n";
+  file << "keyword_weight = " << config.memory.keyword_weight << "\n";
+
+  file << "\n[gateway]\n";
+  file << "require_pairing = " << bool_to_toml(config.gateway.require_pairing) << "\n";
+  file << "paired_tokens = " << string_array_to_toml(config.gateway.paired_tokens) << "\n";
+  file << "allow_public_bind = " << bool_to_toml(config.gateway.allow_public_bind) << "\n";
+  file << "port = " << config.gateway.port << "\n";
+  file << "host = " << common::quote_toml_string(config.gateway.host) << "\n";
+  file << "websocket_enabled = " << bool_to_toml(config.gateway.websocket_enabled) << "\n";
+  file << "websocket_port = " << config.gateway.websocket_port << "\n";
+  file << "websocket_host = " << common::quote_toml_string(config.gateway.websocket_host) << "\n";
+  file << "websocket_tls_enabled = " << bool_to_toml(config.gateway.websocket_tls_enabled) << "\n";
+  file << "websocket_tls_cert_file = "
+       << common::quote_toml_string(config.gateway.websocket_tls_cert_file) << "\n";
+  file << "websocket_tls_key_file = "
+       << common::quote_toml_string(config.gateway.websocket_tls_key_file) << "\n";
+  file << "session_send_policy_enabled = "
+       << bool_to_toml(config.gateway.session_send_policy_enabled) << "\n";
+  file << "session_send_policy_max_per_window = "
+       << config.gateway.session_send_policy_max_per_window << "\n";
+  file << "session_send_policy_window_seconds = "
+       << config.gateway.session_send_policy_window_seconds << "\n";
+
+  file << "\n[autonomy]\n";
+  file << "level = " << common::quote_toml_string(config.autonomy.level) << "\n";
+  file << "workspace_only = " << bool_to_toml(config.autonomy.workspace_only) << "\n";
+  file << "allowed_commands = " << string_array_to_toml(config.autonomy.allowed_commands) << "\n";
+  file << "forbidden_paths = " << string_array_to_toml(config.autonomy.forbidden_paths) << "\n";
+  file << "max_actions_per_hour = " << config.autonomy.max_actions_per_hour << "\n";
+  file << "max_cost_per_day_cents = " << config.autonomy.max_cost_per_day_cents << "\n";
+
+  file << "\n[tunnel]\n";
+  file << "provider = " << common::quote_toml_string(config.tunnel.provider) << "\n";
+  if (config.tunnel.cloudflare.has_value()) {
+    file << "\n[tunnel.cloudflare]\n";
+    file << "command_path = "
+         << common::quote_toml_string(config.tunnel.cloudflare->command_path) << "\n";
+  }
+  if (config.tunnel.ngrok.has_value()) {
+    file << "\n[tunnel.ngrok]\n";
+    file << "auth_token = " << common::quote_toml_string(config.tunnel.ngrok->auth_token)
+         << "\n";
+  }
+  if (config.tunnel.tailscale.has_value()) {
+    file << "\n[tunnel.tailscale]\n";
+    file << "hostname = " << common::quote_toml_string(config.tunnel.tailscale->hostname)
+         << "\n";
+  }
+  if (config.tunnel.custom.has_value()) {
+    file << "\n[tunnel.custom]\n";
+    file << "command = " << common::quote_toml_string(config.tunnel.custom->command) << "\n";
+    file << "args = " << string_array_to_toml(config.tunnel.custom->args) << "\n";
+  }
+
+  if (config.channels.telegram.has_value()) {
+    file << "\n[channels.telegram]\n";
+    file << "bot_token = " << common::quote_toml_string(config.channels.telegram->bot_token)
+         << "\n";
+    file << "allowed_users = "
+         << string_array_to_toml(config.channels.telegram->allowed_users) << "\n";
+  }
+  if (config.channels.discord.has_value()) {
+    file << "\n[channels.discord]\n";
+    file << "bot_token = " << common::quote_toml_string(config.channels.discord->bot_token)
+         << "\n";
+    file << "guild_id = " << common::quote_toml_string(config.channels.discord->guild_id)
+         << "\n";
+    file << "allowed_users = "
+         << string_array_to_toml(config.channels.discord->allowed_users) << "\n";
+  }
+  if (config.channels.slack.has_value()) {
+    file << "\n[channels.slack]\n";
+    file << "bot_token = " << common::quote_toml_string(config.channels.slack->bot_token) << "\n";
+    file << "channel_id = " << common::quote_toml_string(config.channels.slack->channel_id)
+         << "\n";
+    file << "allowed_users = "
+         << string_array_to_toml(config.channels.slack->allowed_users) << "\n";
+  }
+  if (config.channels.matrix.has_value()) {
+    file << "\n[channels.matrix]\n";
+    file << "homeserver = " << common::quote_toml_string(config.channels.matrix->homeserver)
+         << "\n";
+    file << "access_token = "
+         << common::quote_toml_string(config.channels.matrix->access_token) << "\n";
+    file << "room_id = " << common::quote_toml_string(config.channels.matrix->room_id) << "\n";
+  }
+  if (config.channels.imessage.has_value()) {
+    file << "\n[channels.imessage]\n";
+    file << "allowed_contacts = "
+         << string_array_to_toml(config.channels.imessage->allowed_contacts) << "\n";
+  }
+  if (config.channels.whatsapp.has_value()) {
+    file << "\n[channels.whatsapp]\n";
+    file << "access_token = "
+         << common::quote_toml_string(config.channels.whatsapp->access_token) << "\n";
+    file << "phone_number_id = "
+         << common::quote_toml_string(config.channels.whatsapp->phone_number_id) << "\n";
+    file << "verify_token = "
+         << common::quote_toml_string(config.channels.whatsapp->verify_token) << "\n";
+    file << "allowed_numbers = "
+         << string_array_to_toml(config.channels.whatsapp->allowed_numbers) << "\n";
+  }
+  if (config.channels.webhook.has_value()) {
+    file << "\n[channels.webhook]\n";
+    file << "secret = " << common::quote_toml_string(config.channels.webhook->secret) << "\n";
+  }
+
+  file << "\n[observability]\n";
+  file << "backend = " << common::quote_toml_string(config.observability.backend) << "\n";
+
+  file << "\n[runtime]\n";
+  file << "kind = " << common::quote_toml_string(config.runtime.kind) << "\n";
+
+  file << "\n[tools]\n";
+  file << "profile = " << common::quote_toml_string(config.tools.profile) << "\n";
+  file << "\n[tools.allow]\n";
+  file << "groups = " << string_array_to_toml(config.tools.allow.groups) << "\n";
+  file << "tools = " << string_array_to_toml(config.tools.allow.tools) << "\n";
+  file << "deny = " << string_array_to_toml(config.tools.allow.deny) << "\n";
+
+  file << "\n[calendar]\n";
+  file << "backend = " << common::quote_toml_string(config.calendar.backend) << "\n";
+  file << "default_calendar = "
+       << common::quote_toml_string(config.calendar.default_calendar) << "\n";
+
+  file << "\n[email]\n";
+  file << "backend = " << common::quote_toml_string(config.email.backend) << "\n";
+  file << "default_account = " << common::quote_toml_string(config.email.default_account) << "\n";
+  if (config.email.smtp.has_value()) {
+    file << "\n[email.smtp]\n";
+    file << "host = " << common::quote_toml_string(config.email.smtp->host) << "\n";
+    file << "port = " << config.email.smtp->port << "\n";
+    file << "username = " << common::quote_toml_string(config.email.smtp->username) << "\n";
+    file << "password = " << common::quote_toml_string(config.email.smtp->password) << "\n";
+    file << "tls = " << bool_to_toml(config.email.smtp->tls) << "\n";
+  }
+
+  file << "\n[reminders]\n";
+  file << "default_channel = "
+       << common::quote_toml_string(config.reminders.default_channel) << "\n";
+
+  if (config.web_search.provider != "auto" || config.web_search.brave_api_key.has_value()) {
+    file << "\n[web_search]\n";
+    file << "provider = " << common::quote_toml_string(config.web_search.provider) << "\n";
+    if (config.web_search.brave_api_key.has_value()) {
+      file << "brave_api_key = "
+           << common::quote_toml_string(*config.web_search.brave_api_key) << "\n";
+    }
+  }
+
+  file << "\n[secrets]\n";
+  file << "encrypt = " << bool_to_toml(config.secrets.encrypt) << "\n";
+
+  file.close();
+  if (!file) {
+    return common::Status::error("Failed writing temporary config file");
+  }
+
+  std::error_code ec;
+  std::filesystem::rename(tmp_path, path, ec);
+  if (ec) {
+    return common::Status::error("Failed to atomically replace config: " + ec.message());
+  }
+
+  return common::Status::success();
+}
+
+common::Result<std::vector<std::string>> validate_config(const Config &config) {
+  std::vector<std::string> warnings;
+
+  if (!provider_is_known(config.default_provider)) {
+    return common::Result<std::vector<std::string>>::failure("Unknown default provider: " +
+                                                              config.default_provider);
+  }
+
+  if (config.default_temperature < 0.0 || config.default_temperature > 2.0) {
+    return common::Result<std::vector<std::string>>::failure(
+        "default_temperature must be between 0.0 and 2.0");
+  }
+
+  const std::string memory_backend = common::to_lower(config.memory.backend);
+  if (memory_backend != "sqlite" && memory_backend != "markdown" && memory_backend != "none") {
+    return common::Result<std::vector<std::string>>::failure("Invalid memory.backend: " +
+                                                              config.memory.backend);
+  }
+
+  const double weight_sum = config.memory.vector_weight + config.memory.keyword_weight;
+  if (std::abs(weight_sum - 1.0) > 0.001) {
+    warnings.push_back("memory.vector_weight + memory.keyword_weight should equal 1.0");
+  }
+
+  const std::string autonomy = common::to_lower(config.autonomy.level);
+  if (autonomy != "readonly" && autonomy != "supervised" && autonomy != "full") {
+    return common::Result<std::vector<std::string>>::failure("Invalid autonomy.level: " +
+                                                              config.autonomy.level);
+  }
+
+  if (common::to_lower(config.runtime.kind) != "native") {
+    return common::Result<std::vector<std::string>>::failure("Unsupported runtime.kind: " +
+                                                              config.runtime.kind);
+  }
+
+  const std::string tool_profile = common::to_lower(common::trim(config.tools.profile));
+  if (!tool_profile.empty() && tool_profile != "minimal" && tool_profile != "coding" &&
+      tool_profile != "messaging" && tool_profile != "full") {
+    return common::Result<std::vector<std::string>>::failure("Invalid tools.profile: " +
+                                                              config.tools.profile);
+  }
+
+  if (config.email.smtp.has_value() && config.email.smtp->port == 0) {
+    return common::Result<std::vector<std::string>>::failure(
+        "email.smtp.port must be 1-65535");
+  }
+
+  const std::string tunnel_provider = common::to_lower(config.tunnel.provider);
+  if (tunnel_provider != "none" && tunnel_provider != "cloudflare" && tunnel_provider != "ngrok" &&
+      tunnel_provider != "tailscale" && tunnel_provider != "custom") {
+    return common::Result<std::vector<std::string>>::failure("Invalid tunnel.provider: " +
+                                                              config.tunnel.provider);
+  }
+
+  if (config.gateway.port == 0) {
+    return common::Result<std::vector<std::string>>::failure("gateway.port must be 1-65535");
+  }
+
+  if (!is_valid_host(config.gateway.host)) {
+    return common::Result<std::vector<std::string>>::failure("gateway.host is invalid: " +
+                                                              config.gateway.host);
+  }
+  if (!is_valid_host(config.gateway.websocket_host)) {
+    return common::Result<std::vector<std::string>>::failure("gateway.websocket_host is invalid: " +
+                                                              config.gateway.websocket_host);
+  }
+  if (config.gateway.websocket_enabled && config.gateway.websocket_port == 0 &&
+      config.gateway.port == 65535) {
+    return common::Result<std::vector<std::string>>::failure(
+        "gateway.websocket_port must be set when gateway.port is 65535");
+  }
+  if (config.gateway.websocket_tls_enabled) {
+    if (!config.gateway.websocket_enabled) {
+      warnings.push_back("gateway.websocket_tls_enabled is set while websocket is disabled");
+    }
+    if (config.gateway.websocket_tls_cert_file.empty() ||
+        config.gateway.websocket_tls_key_file.empty()) {
+      return common::Result<std::vector<std::string>>::failure(
+          "gateway websocket TLS requires websocket_tls_cert_file and websocket_tls_key_file");
+    }
+    if (!std::filesystem::exists(config.gateway.websocket_tls_cert_file)) {
+      return common::Result<std::vector<std::string>>::failure(
+          "gateway.websocket_tls_cert_file does not exist: " +
+          config.gateway.websocket_tls_cert_file);
+    }
+    if (!std::filesystem::exists(config.gateway.websocket_tls_key_file)) {
+      return common::Result<std::vector<std::string>>::failure(
+          "gateway.websocket_tls_key_file does not exist: " +
+          config.gateway.websocket_tls_key_file);
+    }
+  }
+  if (config.gateway.session_send_policy_enabled &&
+      config.gateway.session_send_policy_max_per_window == 0) {
+    return common::Result<std::vector<std::string>>::failure(
+        "gateway.session_send_policy_max_per_window must be > 0");
+  }
+  if (config.gateway.session_send_policy_enabled &&
+      config.gateway.session_send_policy_window_seconds == 0) {
+    return common::Result<std::vector<std::string>>::failure(
+        "gateway.session_send_policy_window_seconds must be > 0");
+  }
+
+  if (config.gateway.allow_public_bind && tunnel_provider == "none") {
+    warnings.push_back("gateway.allow_public_bind is true without tunnel provider configured");
+  }
+
+  bool api_key_missing = !config.api_key.has_value() || common::trim(*config.api_key).empty();
+  if (api_key_missing && std::getenv("GHOSTCLAW_API_KEY") != nullptr) {
+    api_key_missing = false;
+  }
+  if (api_key_missing) {
+    const std::string provider = normalize_provider_alias(config.default_provider);
+    if ((provider == "xai" || provider == "grok") && std::getenv("XAI_API_KEY") != nullptr) {
+      api_key_missing = false;
+    }
+  }
+  if (api_key_missing) {
+    const std::string provider = normalize_provider_alias(config.default_provider);
+    if ((provider == "openai" || provider == "openai-codex") && auth::has_valid_tokens()) {
+      api_key_missing = false;
+    }
+  }
+  if (api_key_missing) {
+    warnings.push_back("API key is missing (config.api_key, GHOSTCLAW_API_KEY, or provider key env)");
+  }
+
+  if (config.channels.telegram.has_value() && config.channels.telegram->bot_token.empty()) {
+    return common::Result<std::vector<std::string>>::failure(
+        "channels.telegram.bot_token is required when telegram is configured");
+  }
+  if (config.channels.discord.has_value() && config.channels.discord->bot_token.empty()) {
+    return common::Result<std::vector<std::string>>::failure(
+        "channels.discord.bot_token is required when discord is configured");
+  }
+  if (config.channels.slack.has_value() && config.channels.slack->bot_token.empty()) {
+    return common::Result<std::vector<std::string>>::failure(
+        "channels.slack.bot_token is required when slack is configured");
+  }
+  if (config.channels.matrix.has_value()) {
+    const auto &m = *config.channels.matrix;
+    if (m.homeserver.empty() || m.access_token.empty() || m.room_id.empty()) {
+      return common::Result<std::vector<std::string>>::failure(
+          "channels.matrix requires homeserver, access_token, and room_id");
+    }
+  }
+  if (config.channels.whatsapp.has_value()) {
+    const auto &w = *config.channels.whatsapp;
+    if (w.access_token.empty() || w.phone_number_id.empty() || w.verify_token.empty()) {
+      return common::Result<std::vector<std::string>>::failure(
+          "channels.whatsapp requires access_token, phone_number_id, and verify_token");
+    }
+  }
+  if (config.channels.webhook.has_value() && config.channels.webhook->secret.empty()) {
+    return common::Result<std::vector<std::string>>::failure(
+        "channels.webhook.secret is required when webhook is configured");
+  }
+
+  return common::Result<std::vector<std::string>>::success(std::move(warnings));
+}
+
+} // namespace ghostclaw::config

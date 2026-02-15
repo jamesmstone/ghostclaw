@@ -1,0 +1,23 @@
+version: "3.9"
+
+services:
+  ghostclaw:
+    image: ghostclaw:latest
+    container_name: ghostclaw
+    ports:
+      - "8080:8080"
+    environment:
+      - GHOSTCLAW_API_KEY=${GHOSTCLAW_API_KEY:-}
+      - GHOSTCLAW_CONFIG_DIR=/home/ghostclaw/.ghostclaw
+    volumes:
+      - ghostclaw-data:/home/ghostclaw/.ghostclaw
+    command: ["daemon", "--host", "0.0.0.0", "--port", "8080"]
+    healthcheck:
+      test: ["CMD", "ghostclaw", "status"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+    restart: unless-stopped
+
+volumes:
+  ghostclaw-data:

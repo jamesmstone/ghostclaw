@@ -1,0 +1,15 @@
+name: Security
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  static-analysis:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: sudo apt-get update && sudo apt-get install -y cmake clang-tidy cppcheck libcurl4-openssl-dev libssl-dev libsqlite3-dev
+      - run: cmake -S . -B build -DCMAKE_BUILD_TYPE=Debug
+      - run: cppcheck --enable=warning,performance,portability --error-exitcode=1 --inline-suppr src include
