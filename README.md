@@ -10,7 +10,7 @@
 
 **Ghost Protocol. Claw Execution. Zero Compromise. 100% C++. 100% Agnostic.**
 
-🦴 **Grandfather of OpenClaw**
+👑 **Grandfather of OpenClaw**
 ✨ **Smallest and Fastest Feature-Complete Implementation of OpenClaw**
 
 ⚡ Runs on $10 hardware with ~10MB RAM and a ~2MB binary — 99% less memory than OpenClaw
