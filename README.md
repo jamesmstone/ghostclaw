@@ -70,49 +70,80 @@ Fast, small, and fully autonomous AI assistant infrastructure — deploy anywher
 
 ---
 
-## 📊 Benchmark Snapshot
+## 📊 Performance
 
 <div align="center">
 
-*Measured on MacBook Pro M3 Pro (18GB RAM), macOS 26.2, Feb 2026. Release build, `-DCMAKE_BUILD_TYPE=Release`.*
-
-|                            | **OpenClaw** | **NanoBot** | **PicoClaw** | **ZeroClaw** | **GhostClaw** ✨ |
-|----------------------------|:------------:|:-----------:|:------------:|:------------:|:----------------:|
-| **Language**               | TypeScript   | Python      | Go           | Rust         | **C++**          |
-| **RSS Memory**             | > 1GB        | > 100MB     | < 10MB       | < 5MB        | **~10MB** 🏆     |
-| **Peak Footprint**         | —            | —           | —            | —            | **~2MB** 🏆      |
-| **Warm Start**             | > 500ms      | > 30ms      | < 100ms      | ~10ms        | **~15ms** 🚀     |
-| **Cold Start**             | > 5s         | > 1s        | < 1s         | ~440ms       | **~235ms** 🚀    |
-| **Binary Size (stripped)** | ~28MB (dist) | N/A         | ~8MB         | ~3.9MB       | **1.9MB** 🏆     |
+*Real numbers. No marketing. Measured on MacBook Pro M3 Pro, macOS 26.2, Feb 2026.*
 
 </div>
 
+```
+                    GhostClaw v0.1.0 — Release Build
+  ─────────────────────────────────────────────────────────
+
+  BINARY          1,989,792 bytes stripped (1.9 MB)
+                  2,406,968 bytes unstripped (2.3 MB)
+
+  STARTUP         ~15ms warm   (13.5–17.4ms, median of 20 runs)
+                  ~235ms cold  (226–245ms, median of 10 cache-flushed runs)
+
+  MEMORY          ~1.9 MB peak footprint  (process-only, --version)
+                  ~4.9 MB peak footprint  (doctor, full diagnostics)
+                  ~9.5 MB RSS             (includes shared system dylibs)
+
+  ─────────────────────────────────────────────────────────
+  Measured with /usr/bin/time -lp + gettimeofday() wrapper
+```
+
 <details>
-<summary>📈 <b>View Detailed Results</b></summary>
+<summary><b>How does this compare?</b></summary>
 
-### GhostClaw Detailed Measurements
+<br>
 
+For context, here's how GhostClaw stacks up against other AI assistant frameworks. GhostClaw numbers are from our own measurements above. Other tools' numbers are from their published docs or our local reproduction.
+
+**Binary size** — what you ship:
 ```
-Binary:       1,989,792 bytes stripped  (1.9 MB)
-              2,406,968 bytes unstripped (2.3 MB)
-
-Warm start:   ~15ms  (range: 13.5–17.4ms across 20 runs)
-Cold start:   ~235ms (range: 226–245ms across 10 runs, cache-flushed)
-
-RSS memory:   ~9.5 MB  (--version, includes shared system dylibs)
-              ~14.7 MB (doctor, with config + diagnostics loaded)
-Peak footprint: ~1.9 MB  (--version, memory attributed to process only)
-                ~4.9 MB  (doctor)
+  OpenClaw (TS)    ██████████████████████████████████████████  ~28 MB (+ Node.js runtime)
+  PicoClaw (Go)    ████████████                                ~8 MB
+  ZeroClaw (Rust)  ██████                                      ~3.9 MB
+  GhostClaw (C++)  ███                                         ~1.9 MB
 ```
 
-### 🔍 Cold vs Warm Start Explained
+**Warm startup** — repeated invocations, OS cache hot:
+```
+  OpenClaw (TS)    ████████████████████████████████████████████████  > 500 ms
+  PicoClaw (Go)    ████████                                         < 100 ms
+  NanoBot (Py)     ███                                              > 30 ms
+  GhostClaw (C++)  █▌                                               ~15 ms
+  ZeroClaw (Rust)  █                                                ~10 ms
+```
 
-- **Warm Start**: Binary and shared libraries already in OS page cache. This is what you get on repeated runs.
-- **Cold Start**: Binary not in page cache (simulated via cache pressure). Dominated by dylib loading (libcurl, libssl, libsqlite3). This is closer to first-run-after-reboot.
+**Cold startup** — first run after reboot, no page cache:
+```
+  OpenClaw (TS)    ████████████████████████████████████████████████  > 5 s
+  NanoBot (Py)     █████████                                        > 1 s
+  PicoClaw (Go)    ████████                                         < 1 s
+  ZeroClaw (Rust)  ████                                             ~440 ms
+  GhostClaw (C++)  ██                                               ~235 ms
+```
 
-Most interactive usage (running `ghostclaw agent`, `ghostclaw status`, etc.) hits warm-cache paths after the first invocation.
+**Memory (RSS)** — resident set including shared libs:
+```
+  OpenClaw (TS)    ████████████████████████████████████████████████  > 1 GB
+  NanoBot (Py)     █████                                            > 100 MB
+  PicoClaw (Go)    █                                                < 10 MB
+  GhostClaw (C++)  █                                                ~10 MB
+  ZeroClaw (Rust)  ▌                                                < 5 MB
+```
 
-### 🔬 Reproduce Locally
+</details>
+
+<details>
+<summary><b>Reproduce these numbers yourself</b></summary>
+
+<br>
 
 ```bash
 cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
@@ -122,19 +153,19 @@ cmake --build build -j
 strip -o ghostclaw-stripped build/ghostclaw
 ls -lh ghostclaw-stripped
 
-# Memory + timing
+# Memory + timing (single run)
 /usr/bin/time -lp ./build/ghostclaw --version
 
-# Warm start (run a few times first to warm cache, then measure)
+# Warm start (run a few times to warm cache, then measure 20)
 for i in {1..20}; do /usr/bin/time -lp ./build/ghostclaw --version 2>&1 | grep "^real"; done
 
-# Cold start (requires sudo for cache purge)
+# Cold start (macOS — requires sudo)
 sudo purge && /usr/bin/time -lp ./build/ghostclaw --version
 ```
 
-</details>
+**Warm** = 20 consecutive runs, median. **Cold** = fresh binary copy + 512MB random write to flush page cache between runs, median of 10. RSS and footprint from `/usr/bin/time -lp`.
 
-> **How we measured**: `ghostclaw --version`, release build, `/usr/bin/time -lp` for RSS/footprint, custom `gettimeofday()` wrapper for sub-ms startup timing. Warm = 20 consecutive runs (median). Cold = fresh binary copy + 512MB cache-pressure write between runs (median of 10). Other tools' numbers are from their own published benchmarks or our local reproduction where possible.
+</details>
 
 ---
 
