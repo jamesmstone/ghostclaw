@@ -32,6 +32,16 @@ jobs:
       - name: Run benchmarks
         run: ./build/benches/ghostclaw_benchmarks || true
 
+  nix-build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: cachix/install-nix-action@v31
+
+      - name: Build
+        run: nix build --print-build-logs
+
   coverage:
     runs-on: ubuntu-latest
     steps:
